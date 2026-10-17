@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime, timedelta, date
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -783,6 +783,7 @@ def init_db():
         prev_progress INTEGER, created_at INTEGER NOT NULL)''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_task_stages_task ON task_stages(task_id, stage_no)')
     payment_init_tables(c)  # روند پرداخت (مالی / دستور پرداخت)
+    sales_board_init_tables(c)  # تابلو اعلانات فروش (کالا، قیمت‌ها، مشتریان، پیشنهادهای فروش)
     if 'stage_no' not in {r[1] for r in c.execute('PRAGMA table_info(task_attachments)')}:
         c.execute('ALTER TABLE task_attachments ADD COLUMN stage_no INTEGER')  # فایل مربوط به کدام مرحلهٔ تسک چندمرحله‌ای
     c.execute('''CREATE TABLE IF NOT EXISTS projects (
@@ -5014,6 +5015,1053 @@ def print_payment(pid):
         return render_template_string(PAYMENT_PRINT_TEMPLATE, p=p, f=p['form'], fin=p['finance'], events=events,
                                       task=task or {'task_code': '', 'title': ''}, amount=amount,
                                       printed=payment_jalali(int(time.time() * 1000)))
+    finally:
+        conn.close()
+
+
+# ================= تابلو اعلانات فروش (زیر تب روند پرداخت) =================
+# بخش‌ها: مدیریت کالا (با آپلود اکسل)، قیمت‌گذاری مدیر برند با تاریخچهٔ قیمتها،
+# مدیریت مشتریان (با آپلود اکسل) و ثبت پیشنهاد فروش توسط تیم فروش.
+
+SALES_BOARD_ROLES = ('admin', 'administrator', 'manager', 'supervisor', 'specialist')
+SALES_UNITS = ('عدد', 'کیلوگرم', 'لیتر', 'بسته', 'جفت')
+# ستون‌های پذیرفته‌شده در فایل اکسل کالا (نام‌های جایگزین هم پشتیبانی می‌شوند)
+PRODUCT_EXCEL_ALIASES = {
+    'source_product_id': ('SourceProductID', 'SourceProdictID', 'Source Product ID', 'کد کالا', 'کد محصول'),
+    'name': ('Product Name', 'ProductName', 'نام کالا', 'نام محصول'),
+    'unit': ('Unit', 'واحد'),
+    'sub_category': ('SubCategory', 'Sub Category', 'ساب کتگوری', 'زیرشاخه'),
+    'brand': ('Brand', 'برند'),
+}
+CUSTOMER_EXCEL_ALIASES = {
+    'customer_code': ('CustomerCode', 'Customer Code', 'کد مشتری'),
+    'name': ('CustomerName', 'Customer Name', 'نام مشتری'),
+    'brand': ('Brand', 'برند'),
+    'brand_code': ('code-brand', 'Code-Brand', 'CodeBrand', 'کدبرند', 'کد برند'),
+    'company': ('Company', 'CompanyName', 'شرکت', 'نام شرکت'),
+    'address': ('Address', 'آدرس'),
+    'phone': ('Phone', 'Tel', 'Telephone', 'تلفن'),
+    'email': ('Email', 'ایمیل'),
+}
+
+
+def header_variants(title):
+    """شکل‌های مقایسه‌پذیر یک عنوان ستون (حساس به خط تیره، بدون آن و بدون فاصله)."""
+    norm = normalize_header(title)
+    variants = {norm, norm.replace(' ', '-'), norm.replace(' ', '')}
+    return {v for v in variants if v}
+
+
+def map_excel_headers(header_row, aliases):
+    """(نگاشت نام_منطقی -> ایندکس ستون، لیست ستون‌های ناشناخته)"""
+    mapping = {}
+    unknown = []
+    for idx, title in enumerate(header_row):
+        variants = header_variants(title)
+        if not variants:
+            continue
+        matched = None
+        for logical, names in aliases.items():
+            if logical in mapping:
+                continue
+            accepted = set()
+            for name in names:
+                accepted |= header_variants(name)
+            if variants & accepted:
+                matched = logical
+                break
+        if matched:
+            mapping[matched] = idx
+        else:
+            unknown.append(str(title))
+    return mapping, unknown
+
+
+def sales_board_init_tables(c):
+    c.execute('''CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, source_product_id TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL, unit TEXT, sub_category TEXT, brand_id INTEGER, brand_name TEXT,
+        created_at INTEGER, updated_at INTEGER)''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_products_brand ON products(brand_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_products_subcat ON products(sub_category)')
+    # قیمت فعلی هر کالا (تک‌قیمت یا بازه). درصد پایه برای تغییرات درصدی بعدی.
+    c.execute('''CREATE TABLE IF NOT EXISTS product_prices (
+        product_id INTEGER PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'single' CHECK(mode IN ('single','range')),
+        price REAL, min_price REAL, max_price REAL, percent_base REAL, updated_by INTEGER, updated_at INTEGER)''')
+    # تاریخچهٔ قیمتها: هر تغییر قیمت یک رکورد جدید با قیمت قبلی ثبت می‌کند.
+    c.execute('''CREATE TABLE IF NOT EXISTS product_price_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, mode TEXT NOT NULL,
+        price REAL, min_price REAL, max_price REAL, change_note TEXT, changed_by INTEGER, created_at INTEGER)''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_price_history_product ON product_price_history(product_id, id)')
+    c.execute('''CREATE TABLE IF NOT EXISTS customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, customer_key TEXT UNIQUE NOT NULL, customer_code TEXT,
+        name TEXT NOT NULL, brand_id INTEGER, brand_name TEXT, brand_code TEXT, company TEXT,
+        address TEXT, phone TEXT, email TEXT, source TEXT NOT NULL DEFAULT 'manual',
+        created_by INTEGER, created_at INTEGER)''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_customers_brand ON customers(brand_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name)')
+    # پیشنهاد فروش (هر ردیف = یک کالا در پیشنهاد؛ سررسیدهای متعدد = چند ردیف اعتباری)
+    c.execute('''CREATE TABLE IF NOT EXISTS sale_proposals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, proposal_code TEXT NOT NULL UNIQUE,
+        creator_id INTEGER NOT NULL, brand_id INTEGER, brand_name TEXT, job_role TEXT, department TEXT,
+        customer_id INTEGER, customer_key TEXT, customer_name TEXT, is_new_customer INTEGER DEFAULT 0,
+        sub_category TEXT, product_id INTEGER, product_code TEXT, product_name TEXT, unit TEXT,
+        quantity REAL, weight REAL, volume REAL, unit_price REAL, final_amount REAL,
+        description TEXT, checks_in_collection REAL, credit_balance REAL,
+        cash_amount REAL, cash_date TEXT, total_credit REAL, status TEXT NOT NULL DEFAULT 'active',
+        created_at INTEGER)''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_proposals_creator ON sale_proposals(creator_id, id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_proposals_brand ON sale_proposals(brand_id)')
+    c.execute('''CREATE TABLE IF NOT EXISTS sale_proposal_credits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, proposal_id INTEGER NOT NULL, amount REAL NOT NULL,
+        due_date TEXT, FOREIGN KEY(proposal_id) REFERENCES sale_proposals(id) ON DELETE CASCADE)''')
+
+
+def sales_board_access(conn, me):
+    """(allowed, brand_ids|None) — دسترسی به تابلو اعلانات فروش.
+    None یعنی همهٔ برندها (مدیرعامل/Administrator)."""
+    role = me['role'] if me else None
+    if role in SUPER_ROLES:
+        return True, None
+    if role == 'manager':
+        brands = managed_brand_ids(conn, me['id'])
+        return bool(brands), brands
+    if role in ('supervisor', 'specialist'):
+        dept = conn.execute('SELECT department_id FROM users WHERE id=?', (me['id'],)).fetchone()
+        dept_name = ''
+        if dept and dept['department_id']:
+            row = conn.execute('SELECT name FROM departments WHERE id=?', (dept['department_id'],)).fetchone()
+            dept_name = row['name'] if row else ''
+        if 'فروش' not in dept_name:
+            return False, set()
+        return True, user_brand_ids(conn, me['id'])
+    return False, set()
+
+
+def sales_scoped_brands(conn, me):
+    """برندهایی که کاربر فعلی در تابلو اعلانات فروش مجاز به دیدنشان است.
+    None یعنی بدون محدودیت."""
+    allowed, brands = sales_board_access(conn, me)
+    if not allowed:
+        return set()
+    return brands
+
+
+def sales_row_brand_filter(field='brand_id'):
+    """شرط SQL محدودسازی ردیف‌ها به برندهای مجاز؛ {brands} با placeholder جایگزین می‌شود."""
+    return f'{field} IS NOT NULL AND {field} IN ({{brands}})'
+
+
+def excel_table_from_upload(file_storage):
+    """اولین برگٔ فایل اکسل را به فهرست ردیف‌های متنی تبدیل می‌کند."""
+    if file_storage is None or not file_storage.filename:
+        return None, 'فایل اکسل انتخاب نشده است'
+    if not file_storage.filename.lower().endswith(('.xlsx', '.xlsm')):
+        return None, 'فقط فایل اکسل با پسوند xlsx یا xlsm پذیرفته می‌شود'
+    try:
+        wb = load_workbook(file_storage.stream, read_only=True, data_only=True)
+    except Exception:
+        return None, 'فایل اکسل خوانده نشد؛ مطمئن شوید فرمت معتبر است'
+    ws = wb.active
+    rows = []
+    for raw in ws.iter_rows(values_only=True):
+        rows.append([('' if cell is None else str(cell).strip()) for cell in raw])
+    wb.close()
+    if not rows:
+        return None, 'فایل اکسل خالی است'
+    return rows, None
+
+
+def normalize_header(title):
+    return ' '.join(str(title or '').strip().lower().replace('\u200c', ' ').replace('_', ' ').split())
+
+
+def map_excel_headers(header_row, aliases):
+    """(نگاشت نام_منطقی -> ایندکس ستون، لیست ستون‌های ناشناخته)"""
+    mapping = {}
+    unknown = []
+    for idx, title in enumerate(header_row):
+        norm = normalize_header(title)
+        if not norm:
+            continue
+        matched = None
+        for logical, names in aliases.items():
+            if norm in {normalize_header(n) for n in names} and logical not in mapping:
+                matched = logical
+                break
+        if matched:
+            mapping[matched] = idx
+        else:
+            unknown.append(str(title))
+    return mapping, unknown
+
+
+def cell_value(row, mapping, key):
+    idx = mapping.get(key)
+    if idx is None or idx >= len(row):
+        return ''
+    return str(row[idx] or '').strip()
+
+
+def parse_number(value):
+    s = str(value or '').strip().replace(',', '').replace('\u066b', '.').replace('%', '')
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def jalali_today_str():
+    return date.today().isoformat()
+
+
+def new_customer_key(conn):
+    while True:
+        key = 'CUS-' + uuid.uuid4().hex[:8].upper()
+        if not conn.execute('SELECT 1 FROM customers WHERE customer_key=?', (key,)).fetchone():
+            return key
+
+
+def next_proposal_code(conn):
+    last = conn.execute("SELECT MAX(CAST(substr(proposal_code,5) AS INTEGER)) FROM sale_proposals "
+                        "WHERE proposal_code LIKE 'SP-%'").fetchone()[0] or 0
+    return f'SP-{last + 1:06d}'
+
+
+def record_price_history(c, product_id, mode, price, min_price, max_price, note, actor_id, when_ms):
+    c.execute('''INSERT INTO product_price_history (product_id,mode,price,min_price,max_price,change_note,changed_by,created_at)
+                 VALUES (?,?,?,?,?,?,?,?)''',
+              (product_id, mode, price, min_price, max_price, note, actor_id, when_ms))
+
+
+def upsert_product_price(c, product_id, mode, price, min_price, max_price, percent_base, actor_id, now_ms):
+    """ثبت قیمت جدید؛ قیمت قبلی قبل از بازنویسی در تاریخچه حفظ می‌شود."""
+    prev = c.execute('SELECT * FROM product_prices WHERE product_id=?', (product_id,)).fetchone()
+    if prev:
+        record_price_history(c, product_id, prev['mode'], prev['price'], prev['min_price'], prev['max_price'],
+                             'جایگزینی قیمت قبلی', prev['updated_by'], prev['updated_at'] or now_ms)
+    c.execute('''INSERT INTO product_prices (product_id,mode,price,min_price,max_price,percent_base,updated_by,updated_at)
+                 VALUES (?,?,?,?,?,?,?,?)
+                 ON CONFLICT(product_id) DO UPDATE SET mode=excluded.mode, price=excluded.price,
+                   min_price=excluded.min_price, max_price=excluded.max_price,
+                   percent_base=excluded.percent_base, updated_by=excluded.updated_by, updated_at=excluded.updated_at''',
+              (product_id, mode, price, min_price, max_price, percent_base, actor_id, now_ms))
+
+
+def resolve_product_brand(conn, c, brand_name, brand_id=None):
+    if brand_id:
+        row = conn.execute('SELECT id, name FROM brands WHERE id=?', (brand_id,)).fetchone()
+        if row:
+            return row['id'], row['name']
+    if brand_name:
+        row = conn.execute('SELECT id, name FROM brands WHERE lower(name)=lower(?)', (brand_name,)).fetchone()
+        if row:
+            return row['id'], row['name']
+    return None, (brand_name or None)
+
+
+def default_user_brand(conn, me):
+    """برند پیش‌فرض کاربر برای فایل‌های اکسل بدون ستون برند."""
+    if me['role'] in SUPER_ROLES:
+        return None
+    row = conn.execute('SELECT brand_id FROM users WHERE id=?', (me['id'],)).fetchone()
+    return row['brand_id'] if row else None
+
+
+@app.route('/api/sales-board/access')
+@login_required
+def sales_board_access_api():
+    """وضعیت دسترسی کاربر به تابلو اعلانات فروش + نقش/بخش/برند او برای رابط کاربری."""
+    me = current_user()
+    conn = get_db()
+    try:
+        allowed, brands = sales_board_access(conn, me)
+        if not allowed:
+            return jsonify({'allowed': False})
+        full = brands is None
+        brand_rows = conn.execute('SELECT id, name FROM brands ORDER BY id').fetchall()
+        visible = [dict(b) for b in brand_rows if full or b['id'] in brands]
+        profile = conn.execute('''SELECT u.name, u.role, u.department_id, d.name AS department_name,
+                                         r.name AS job_role_name
+                                  FROM users u LEFT JOIN departments d ON d.id=u.department_id
+                                  LEFT JOIN job_roles r ON r.id=u.job_role_id WHERE u.id=?''', (me['id'],)).fetchone()
+        return jsonify({
+            'allowed': True, 'fullAccess': full, 'brands': visible,
+            'canManageProducts': True,
+            'canSetPrices': bool(profile and profile['role'] in SUPER_ROLES + ('manager',)),
+            'canCreateProposal': bool(profile and profile['role'] == 'specialist'),
+            'profile': {'name': profile['name'], 'role': profile['role'],
+                        'roleName': {'admin': 'مدیرعامل', 'administrator': 'Administrator', 'manager': 'مدیر برند',
+                                     'supervisor': 'سرپرست', 'specialist': 'کارشناس', 'employee': 'کارمند'}
+                                    .get(profile['role'], profile['role']),
+                        'department': profile['department_name'], 'jobRole': profile['job_role_name']},
+        })
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/products')
+@login_required
+def list_products():
+    me = current_user()
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        where, params = '', []
+        search = str(request.args.get('q') or '').strip()
+        sub = str(request.args.get('sub_category') or '').strip()
+        brand = request.args.get('brand_id')
+        if brands is not None:
+            where = f'p.brand_id IN ({",".join("?" * len(brands))})'
+            params += list(brands)
+        if search:
+            where = (where + ' AND ' if where else '') + '(p.name LIKE ? OR p.source_product_id LIKE ? OR p.sub_category LIKE ?)'
+            params += [f'%{search}%'] * 3
+        if sub:
+            where = (where + ' AND ' if where else '') + 'p.sub_category=?'
+            params.append(sub)
+        if brand:
+            where = (where + ' AND ' if where else '') + 'p.brand_id=?'
+            params.append(int(brand))
+        rows = conn.execute(f'''SELECT p.*, pp.mode AS price_mode, pp.price, pp.min_price, pp.max_price,
+                                        pp.updated_at AS price_updated_at
+                                 FROM products p LEFT JOIN product_prices pp ON pp.product_id=p.id
+                                 {"WHERE " + where if where else ""} ORDER BY p.name COLLATE NOCASE''', params).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/products/subcategories')
+@login_required
+def list_product_subcategories():
+    me = current_user()
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify([])
+        where, params = 'sub_category IS NOT NULL AND TRIM(sub_category)<>""', []
+        if brands is not None:
+            where += f' AND brand_id IN ({",".join("?" * len(brands))})'
+            params += list(brands)
+        rows = conn.execute(f'SELECT DISTINCT sub_category FROM products WHERE {where} ORDER BY sub_category',
+                            params).fetchall()
+        return jsonify([r['sub_category'] for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/products', methods=['POST'])
+@login_required
+def create_product():
+    me = current_user()
+    data = request.json or {}
+    code = str(data.get('source_product_id') or '').strip()
+    name = str(data.get('name') or '').strip()
+    if not code or not name:
+        return jsonify({'error': 'کد کالا و نام کالا الزامی است'}), 400
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        brand_id = data.get('brand_id')
+        brand_id = int(brand_id) if brand_id not in (None, '') else None
+        if brands is not None:
+            if brand_id not in brands:
+                return jsonify({'error': 'فقط می‌توانید کالای برندهای خود را ثبت کنید'}), 403
+        elif brand_id is None and not is_super(me):
+            return jsonify({'error': 'برند را انتخاب کنید'}), 400
+        if conn.execute('SELECT 1 FROM products WHERE source_product_id=?', (code,)).fetchone():
+            return jsonify({'error': f'کد کالا «{code}» قبلاً ثبت شده است'}), 409
+        brand_id, brand_name = resolve_product_brand(conn, None, data.get('brand_name'), brand_id)
+        now_ms = int(time.time() * 1000)
+        cur = conn.execute('''INSERT INTO products (source_product_id,name,unit,sub_category,brand_id,brand_name,created_at,updated_at)
+                              VALUES (?,?,?,?,?,?,?,?)''',
+                           (code, name, str(data.get('unit') or '').strip() or None,
+                            str(data.get('sub_category') or '').strip() or None, brand_id, brand_name, now_ms, now_ms))
+        conn.commit()
+        return jsonify({'success': True, 'id': cur.lastrowid})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/products/<int:pid>', methods=['PUT'])
+@login_required
+def update_product(pid):
+    me = current_user()
+    data = request.json or {}
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        product = conn.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
+        if not product:
+            return jsonify({'error': 'کالا پیدا نشد'}), 404
+        if brands is not None and product['brand_id'] not in brands:
+            return jsonify({'error': 'فقط کالاهای برندهای خود را می‌توانید ویرایش کنید'}), 403
+        fields = {k: data[k] for k in ('name', 'unit', 'sub_category', 'brand_name') if k in data}
+        if 'brand_id' in data:
+            brand_id = data['brand_id']
+            fields['brand_id'] = int(brand_id) if brand_id not in (None, '') else None
+            if brands is not None and fields['brand_id'] not in brands:
+                return jsonify({'error': 'انتقال کالا به برند دیگر مجاز نیست'}), 403
+        sets = ', '.join(f'{k}=?' for k in fields)
+        conn.execute(f'UPDATE products SET {sets}, updated_at=? WHERE id=?',
+                     (*fields.values(), int(time.time() * 1000), pid))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/products/import', methods=['POST'])
+@login_required
+def import_products_excel():
+    """آپلود اکسل کالا: کدهای جدید درج و کدهای تکراری بروزرسانی می‌شوند."""
+    me = current_user()
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        rows, err = excel_table_from_upload(request.files.get('file'))
+        if err:
+            return jsonify({'error': err}), 400
+        header_idx = next((i for i, r in enumerate(rows)
+                           if any(str(x or '').strip().lower().replace('\u200c', ' ').find('sourcepro') == 0
+                                  or str(x or '').strip() in ('کد کالا', 'کد محصول') for x in r)), None)
+        if header_idx is None:
+            return jsonify({'error': 'سطر عنوان با ستون SourceProductID (یا «کد کالا») پیدا نشد'}), 400
+        mapping, _unknown = map_excel_headers(rows[header_idx], PRODUCT_EXCEL_ALIASES)
+        if 'source_product_id' not in mapping or 'name' not in mapping:
+            return jsonify({'error': 'ستون‌های الزامی SourceProductID و Product Name در فایل وجود ندارند'}), 400
+        now_ms = int(time.time() * 1000)
+        fallback_brand = default_user_brand(conn, me) if brands is not None else None
+        added = updated = skipped = 0
+        errors = []
+        lock_for_create(conn)
+        seen_codes = set()
+        for line_no, row in enumerate(rows[header_idx + 1:], start=header_idx + 2):
+            code = cell_value(row, mapping, 'source_product_id')
+            name = cell_value(row, mapping, 'name')
+            if not code and not name:
+                continue
+            if not code:
+                skipped += 1
+                errors.append(f'سطر {line_no}: کد کالا خالی است')
+                continue
+            if code in seen_codes:
+                skipped += 1
+                errors.append(f'سطر {line_no}: کد کالا «{code}» تکراری است در همین فایل')
+                continue
+            seen_codes.add(code)
+            unit = cell_value(row, mapping, 'unit') or None
+            sub = cell_value(row, mapping, 'sub_category') or None
+            brand_name_raw = cell_value(row, mapping, 'brand') or None
+            brand_id, brand_name = resolve_product_brand(conn, None, brand_name_raw)
+            if brand_id is None and not brand_name_raw:
+                brand_id, brand_name = fallback_brand, None
+                if brand_id:
+                    b = conn.execute('SELECT name FROM brands WHERE id=?', (brand_id,)).fetchone()
+                    brand_name = b['name'] if b else None
+            if brands is not None and brand_id not in brands:
+                skipped += 1
+                errors.append(f'سطر {line_no}: برند «{brand_name_raw or "بدون برند"}» خارج از محدودهٔ دسترسی شماست')
+                continue
+            existing = conn.execute('SELECT * FROM products WHERE source_product_id=?', (code,)).fetchone()
+            if existing:
+                conn.execute('''UPDATE products SET name=?, unit=COALESCE(?,unit), sub_category=COALESCE(?,sub_category),
+                                brand_id=COALESCE(?,brand_id), brand_name=COALESCE(?,brand_name), updated_at=?
+                                WHERE id=?''', (name or existing['name'], unit, sub, brand_id, brand_name, now_ms,
+                                                 existing['id']))
+                updated += 1
+            else:
+                conn.execute('''INSERT INTO products (source_product_id,name,unit,sub_category,brand_id,brand_name,created_at,updated_at)
+                                VALUES (?,?,?,?,?,?,?,?)''',
+                             (code, name, unit, sub, brand_id, brand_name, now_ms, now_ms))
+                added += 1
+        conn.commit()
+        return jsonify({'success': True, 'added': added, 'updated': updated, 'skipped': skipped,
+                        'errors': errors[:20], 'message': f'{added} کالا افزوده و {updated} کالا بروزرسانی شد'})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/prices')
+@login_required
+def list_product_prices():
+    """فهرست کالاهای قابل قیمت‌گذاری همراه قیمت فعلی (برای تب قیمت‌گذاری مدیر برند)."""
+    me = current_user()
+    conn = get_db()
+    try:
+        allowed, brands = sales_board_access(conn, me)
+        if not allowed or (brands is not None and not brands):
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        if brands is None:
+            rows = conn.execute('''SELECT p.id, p.source_product_id, p.name, p.unit, p.sub_category,
+                                          p.brand_id, p.brand_name, b.name AS brand_label,
+                                          pp.mode AS price_mode, pp.price, pp.min_price, pp.max_price, pp.percent_base
+                                   FROM products p LEFT JOIN product_prices pp ON pp.product_id=p.id
+                                   LEFT JOIN brands b ON b.id=p.brand_id ORDER BY p.name COLLATE NOCASE''').fetchall()
+        else:
+            rows = conn.execute(f'''SELECT p.id, p.source_product_id, p.name, p.unit, p.sub_category,
+                                            p.brand_id, p.brand_name, b.name AS brand_label,
+                                            pp.mode AS price_mode, pp.price, pp.min_price, pp.max_price, pp.percent_base
+                                     FROM products p LEFT JOIN product_prices pp ON pp.product_id=p.id
+                                     LEFT JOIN brands b ON b.id=p.brand_id
+                                     WHERE p.brand_id IN ({",".join("?" * len(brands))})
+                                     ORDER BY p.name COLLATE NOCASE''', list(brands)).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/prices/set', methods=['POST'])
+@login_required
+def set_product_price():
+    """تعیین تک‌قیمت یا بازهٔ قیمتی. حالت percent: افزایش/کاهش درصدی از آخرین قیمت ثبت‌شده.
+    هر تغییر، قیمت قبلی را در تاریخچه حفظ می‌کند."""
+    me = current_user()
+    data = request.json or {}
+    conn = get_db()
+    try:
+        allowed, brands = sales_board_access(conn, me)
+        if not allowed:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        if me['role'] not in SUPER_ROLES + ('manager',):
+            return jsonify({'error': 'فقط مدیرعامل و مدیر برند می‌توانند قیمت‌گذاری کنند'}), 403
+        try:
+            product_id = int(data.get('product_id'))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'کالا نامعتبر است'}), 400
+        product = conn.execute('SELECT * FROM products WHERE id=?', (product_id,)).fetchone()
+        if not product:
+            return jsonify({'error': 'کالا پیدا نشد'}), 404
+        if brands is not None and product['brand_id'] not in brands:
+            return jsonify({'error': 'فقط کالاهای برندهای خود را می‌توانید قیمت‌گذاری کنید'}), 403
+        mode = str(data.get('mode') or 'single')
+        if mode not in ('single', 'range', 'percent'):
+            return jsonify({'error': 'حالت قیمت نامعتبر است'}), 400
+        now_ms = int(time.time() * 1000)
+        c = conn.cursor()
+        lock_for_create(conn)
+        current = c.execute('SELECT * FROM product_prices WHERE product_id=?', (product_id,)).fetchone()
+        if mode == 'percent':
+            if not current:
+                return jsonify({'error': 'ابتدا باید یک قیمت یا بازه برای این کالا ثبت شود'}), 400
+            pct = parse_number(data.get('percent'))
+            if pct is None:
+                return jsonify({'error': 'درصد را وارد کنید (مثلاً ۵ یا -۵)'}), 400
+            base = current['percent_base']
+            if base is None:
+                base = current['price'] if current['mode'] == 'single' and current['price'] is not None else None
+                if base is None and current['mode'] == 'range':
+                    base = ((current['min_price'] or 0) + (current['max_price'] or 0)) / 2
+                if base is None:
+                    return jsonify({'error': 'پایهٔ محاسبهٔ درصد موجود نیست؛ ابتدا قیمت ثابت ثبت کنید'}), 400
+                c.execute('UPDATE product_prices SET percent_base=? WHERE product_id=?', (base, product_id))
+            factor = 1 + pct / 100.0
+            if current['mode'] == 'range':
+                price = None
+                min_p = round((current['min_price'] or 0) * factor, 2)
+                max_p = round((current['max_price'] or 0) * factor, 2)
+            else:
+                price = round((current['price'] or 0) * factor, 2)
+                min_p = max_p = None
+            c.execute('''UPDATE product_prices SET mode=?, price=?, min_price=?, max_price=?, updated_by=?, updated_at=?
+                         WHERE product_id=?''', (current['mode'], price, min_p, max_p, me['id'], now_ms, product_id))
+            record_price_history(c, product_id, current['mode'], price, min_p, max_p,
+                                 f'تغییر درصدی {pct:+g}٪ (پایه {base:g})', me['id'], now_ms)
+        elif mode == 'range':
+            min_p = parse_number(data.get('min_price'))
+            max_p = parse_number(data.get('max_price'))
+            if min_p is None or max_p is None or min_p <= 0 or max_p < min_p:
+                return jsonify({'error': 'بازهٔ قیمتی معتبر وارد کنید (حداقل ≤ حداکثر، هر دو بزرگ‌تر از صفر)'}), 400
+            upsert_product_price(c, product_id, 'range', None, min_p, max_p, None, me['id'], now_ms)
+            record_price_history(c, product_id, 'range', None, min_p, max_p, 'ثبت بازهٔ قیمتی جدید', me['id'], now_ms)
+        else:
+            price = parse_number(data.get('price'))
+            if price is None or price <= 0:
+                return jsonify({'error': 'قیمت معتبر (بزرگ‌تر از صفر) وارد کنید'}), 400
+            upsert_product_price(c, product_id, 'single', price, None, None, price, me['id'], now_ms)
+            record_price_history(c, product_id, 'single', price, None, None, 'ثبت تک‌قیمت جدید', me['id'], now_ms)
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/prices/history/<int:product_id>')
+@login_required
+def product_price_history(product_id):
+    me = current_user()
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        product = conn.execute('SELECT * FROM products WHERE id=?', (product_id,)).fetchone()
+        if not product:
+            return jsonify({'error': 'کالا پیدا نشد'}), 404
+        if brands is not None and product['brand_id'] not in brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        rows = conn.execute('''SELECT h.*, u.name AS changer FROM product_price_history h
+                               LEFT JOIN users u ON u.id=h.changed_by WHERE h.product_id=? ORDER BY h.id DESC''',
+                            (product_id,)).fetchall()
+        return jsonify({'product': dict(product), 'history': [dict(r) for r in rows]})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/customers')
+@login_required
+def list_customers():
+    me = current_user()
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        where, params = '', []
+        search = str(request.args.get('q') or '').strip()
+        brand = request.args.get('brand_id')
+        if brands is not None:
+            where = f'c.brand_id IN ({",".join("?" * len(brands))})'
+            params += list(brands)
+        if search:
+            where = (where + ' AND ' if where else '') + \
+                    '(c.name LIKE ? OR c.customer_key LIKE ? OR IFNULL(c.customer_code,\'\') LIKE ? OR IFNULL(c.company,\'\') LIKE ?)'
+            params += [f'%{search}%'] * 4
+        if brand:
+            where = (where + ' AND ' if where else '') + 'c.brand_id=?'
+            params.append(int(brand))
+        rows = conn.execute(f'''SELECT c.* FROM customers c {"WHERE " + where if where else ""}
+                                 ORDER BY c.name COLLATE NOCASE''', params).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/customers', methods=['POST'])
+@login_required
+def create_customer():
+    me = current_user()
+    data = request.json or {}
+    name = str(data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'نام مشتری الزامی است'}), 400
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        brand_id = data.get('brand_id')
+        brand_id = int(brand_id) if brand_id not in (None, '') else None
+        if brands is not None and brand_id not in brands:
+            return jsonify({'error': 'فقط برای برندهای خود می‌توانید مشتری ثبت کنید'}), 403
+        brand_id, brand_name = resolve_product_brand(conn, None, data.get('brand_name'), brand_id)
+        key = new_customer_key(conn)
+        cur = conn.execute('''INSERT INTO customers (customer_key,customer_code,name,brand_id,brand_name,brand_code,
+                              company,address,phone,email,source,created_by,created_at)
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                           (key, str(data.get('customer_code') or '').strip() or None, name, brand_id, brand_name,
+                            str(data.get('brand_code') or '').strip() or None,
+                            str(data.get('company') or '').strip() or None,
+                            str(data.get('address') or '').strip() or None,
+                            str(data.get('phone') or '').strip() or None,
+                            str(data.get('email') or '').strip() or None,
+                            'manual', me['id'], int(time.time() * 1000)))
+        conn.commit()
+        return jsonify({'success': True, 'id': cur.lastrowid, 'customer_key': key})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/customers/<int:cid>', methods=['PUT'])
+@login_required
+def update_customer(cid):
+    me = current_user()
+    data = request.json or {}
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        customer = conn.execute('SELECT * FROM customers WHERE id=?', (cid,)).fetchone()
+        if not customer:
+            return jsonify({'error': 'مشتری پیدا نشد'}), 404
+        if brands is not None and customer['brand_id'] not in brands:
+            return jsonify({'error': 'فقط مشتریان برندهای خود را می‌توانید ویرایش کنید'}), 403
+        fields = {k: str(data[k]).strip() or None for k in
+                  ('customer_code', 'name', 'brand_code', 'company', 'address', 'phone', 'email') if k in data}
+        if 'brand_id' in data:
+            brand_id = data['brand_id']
+            fields['brand_id'] = int(brand_id) if brand_id not in (None, '') else None
+            if brands is not None and fields['brand_id'] not in brands:
+                return jsonify({'error': 'انتقال مشتری به برند دیگر مجاز نیست'}), 403
+            _, fields['brand_name'] = resolve_product_brand(conn, None, data.get('brand_name'), fields['brand_id'])
+        if not fields:
+            return jsonify({'success': True})
+        sets = ', '.join(f'{k}=?' for k in fields)
+        conn.execute(f'UPDATE customers SET {sets} WHERE id=?', (*fields.values(), cid))
+        conn.commit()
+        return jsonify({'success': True})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/customers/import', methods=['POST'])
+@login_required
+def import_customers_excel():
+    """آپلود اکسل مشتریان: کد مشتری تکراری فقط اگر کدبرند متفاوت باشد رکورد جدید می‌سازد؛
+    در غیر این صورت تکراری نادیده گرفته می‌شود. CustomerKey خودکار و یونیک ساخته می‌شود."""
+    me = current_user()
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        rows, err = excel_table_from_upload(request.files.get('file'))
+        if err:
+            return jsonify({'error': err}), 400
+        header_idx = next((i for i, r in enumerate(rows)
+                           if any(str(x or '').strip().lower().replace('\u200c', '-').replace(' ', '-') == 'customercode'
+                                  or str(x or '').strip() == 'کد مشتری' for x in r)), None)
+        if header_idx is None:
+            return jsonify({'error': 'سطر عنوان با ستون CustomerCode (یا «کد مشتری») پیدا نشد'}), 400
+        mapping, _unknown = map_excel_headers(rows[header_idx], CUSTOMER_EXCEL_ALIASES)
+        required = ('customer_code', 'name', 'brand', 'brand_code')
+        missing = [k for k in required if k not in mapping]
+        if missing:
+            return jsonify({'error': 'ستون‌های زیر در فایل وجود ندارند: ' + ', '.join(missing)}), 400
+        now_ms = int(time.time() * 1000)
+        fallback_brand = default_user_brand(conn, me) if brands is not None else None
+        added = skipped = 0
+        errors = []
+        lock_for_create(conn)
+        for line_no, row in enumerate(rows[header_idx + 1:], start=header_idx + 2):
+            code = cell_value(row, mapping, 'customer_code')
+            name = cell_value(row, mapping, 'name')
+            brand_name_raw = cell_value(row, mapping, 'brand')
+            brand_code = cell_value(row, mapping, 'brand_code')
+            if not code and not name:
+                continue
+            if not code:
+                skipped += 1
+                errors.append(f'سطر {line_no}: کد مشتری خالی است')
+                continue
+            brand_id, brand_name = resolve_product_brand(conn, None, brand_name_raw)
+            if brand_id is None and not brand_name_raw:
+                brand_id, brand_name = fallback_brand, None
+                if brand_id:
+                    b = conn.execute('SELECT name FROM brands WHERE id=?', (brand_id,)).fetchone()
+                    brand_name = b['name'] if b else None
+            if brands is not None and brand_id not in brands:
+                skipped += 1
+                errors.append(f'سطر {line_no}: برند «{brand_name_raw or "بدون برند"}» خارج از محدودهٔ دسترسی شماست')
+                continue
+            duplicate = conn.execute('''SELECT 1 FROM customers WHERE customer_code=? AND IFNULL(brand_code,'')=?''',
+                                     (code, brand_code)).fetchone()
+            if duplicate:
+                skipped += 1
+                continue
+            cur = conn.execute('''INSERT INTO customers (customer_key,customer_code,name,brand_id,brand_name,brand_code,
+                                  company,address,phone,email,source,created_by,created_at)
+                                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                               (new_customer_key(conn), code, name or code, brand_id, brand_name, brand_code or None,
+                                cell_value(row, mapping, 'company') or None,
+                                cell_value(row, mapping, 'address') or None,
+                                cell_value(row, mapping, 'phone') or None,
+                                cell_value(row, mapping, 'email') or None,
+                                'excel', me['id'], now_ms))
+            added += 1
+        conn.commit()
+        return jsonify({'success': True, 'added': added, 'skipped': skipped, 'errors': errors[:20],
+                        'message': f'{added} مشتری افزوده و {skipped} ردیف تکراری/نامعتبر نادیده گرفته شد'})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/proposal-options')
+@login_required
+def proposal_options():
+    """اطلاعات لاگین فروشنده + مشتریان، ساب‌کتگوری‌ها و کالاهای برند خودش برای فرم پیشنهاد فروش."""
+    me = current_user()
+    conn = get_db()
+    try:
+        allowed, brands = sales_board_access(conn, me)
+        if not allowed or (brands is not None and not brands):
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        profile = conn.execute('''SELECT u.name, u.role, d.name AS department_name, r.name AS job_role_name
+                                  FROM users u LEFT JOIN departments d ON d.id=u.department_id
+                                  LEFT JOIN job_roles r ON r.id=u.job_role_id WHERE u.id=?''', (me['id'],)).fetchone()
+        brand_list = sorted(brands) if brands is not None else None
+        if brand_list:
+            ph = ','.join('?' * len(brand_list))
+            customers = conn.execute(f'''SELECT id, customer_key, customer_code, name, brand_id, brand_name, company
+                                          FROM customers WHERE brand_id IN ({ph}) ORDER BY name COLLATE NOCASE''',
+                                     brand_list).fetchall()
+            subcats = conn.execute(f'''SELECT DISTINCT sub_category FROM products
+                                        WHERE brand_id IN ({ph}) AND sub_category IS NOT NULL AND TRIM(sub_category)<>''
+                                        ORDER BY sub_category''', brand_list).fetchall()
+        else:
+            customers = conn.execute('''SELECT id, customer_key, customer_code, name, brand_id, brand_name, company
+                                        FROM customers ORDER BY name COLLATE NOCASE''').fetchall()
+            subcats = conn.execute('''SELECT DISTINCT sub_category FROM products
+                                      WHERE sub_category IS NOT NULL AND TRIM(sub_category)<>'' ORDER BY sub_category''').fetchall()
+        brands_out = conn.execute('SELECT id, name FROM brands ORDER BY id').fetchall()
+        visible_brands = [dict(b) for b in brands_out if brand_list is None or b['id'] in brand_list]
+        return jsonify({
+            'seller': {'name': profile['name'], 'roleName': {'admin': 'مدیرعامل', 'administrator': 'Administrator',
+                                                              'manager': 'مدیر برند', 'supervisor': 'سرپرست',
+                                                              'specialist': 'کارشناس', 'employee': 'کارمند'}
+                                                             .get(profile['role'], profile['role']),
+                       'department': profile['department_name'], 'jobRole': profile['job_role_name'],
+                       'brands': [b['name'] for b in conn.execute(
+                           f'SELECT b.name FROM brands b WHERE b.id IN ({",".join("?" * len(brand_list))})'
+                           if brand_list else 'SELECT name FROM brands WHERE 0').fetchall()] if brand_list else
+                                  [b['name'] for b in brands_out]},
+            'customers': [dict(r) for r in customers],
+            'subCategories': [r['sub_category'] for r in subcats],
+            'brands': visible_brands,
+            'units': list(SALES_UNITS),
+        })
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/proposal-products')
+@login_required
+def proposal_products():
+    """کالاهای یک ساب‌کتگوری در برندهای فروشنده (برای انتخاب با جستجوی نام یا کد)."""
+    me = current_user()
+    sub = str(request.args.get('sub_category') or '').strip()
+    if not sub:
+        return jsonify({'error': 'ساب‌کتگوری را مشخص کنید'}), 400
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        params = [sub]
+        where = 'p.sub_category=?'
+        if brands is not None:
+            where += f' AND p.brand_id IN ({",".join("?" * len(brands))})'
+            params += list(brands)
+        q = str(request.args.get('q') or '').strip()
+        if q:
+            where += ' AND (p.name LIKE ? OR p.source_product_id LIKE ?)'
+            params += [f'%{q}%'] * 2
+        rows = conn.execute(f'''SELECT p.id, p.source_product_id, p.name, p.unit, p.sub_category, p.brand_id, p.brand_name,
+                                       pp.mode AS price_mode, pp.price, pp.min_price, pp.max_price
+                                FROM products p LEFT JOIN product_prices pp ON pp.product_id=p.id
+                                WHERE {where} ORDER BY p.name COLLATE NOCASE''', params).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/customers/check-name')
+@login_required
+def check_customer_name():
+    """بررسی تکراری بودن نام مشتری جدید (در همان برند)."""
+    me = current_user()
+    name = str(request.args.get('name') or '').strip()
+    brand_id = request.args.get('brand_id')
+    conn = get_db()
+    try:
+        brands = sales_scoped_brands(conn, me)
+        if brands is not None and not brands:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        where, params = 'name=?', [name]
+        if brand_id:
+            where += ' AND brand_id=?'
+            params.append(int(brand_id))
+        elif brands is not None:
+            where += f' AND brand_id IN ({",".join("?" * len(brands))})'
+            params += list(brands)
+        exists = conn.execute(f'SELECT 1 FROM customers WHERE {where} LIMIT 1', params).fetchone() is not None
+        return jsonify({'exists': exists})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/proposals', methods=['GET', 'POST'])
+@login_required
+def sale_proposals():
+    me = current_user()
+    conn = get_db()
+    try:
+        allowed, brands = sales_board_access(conn, me)
+        if not allowed:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        if request.method == 'GET':
+            scope_brand_sql = None
+            if brands is not None:
+                if not brands:
+                    return jsonify([])
+                scope_brand_sql = ','.join(str(int(b)) for b in brands)
+            if request.args.get('mine') == '1':
+                rows = conn.execute('SELECT * FROM sale_proposals WHERE creator_id=? ORDER BY id DESC',
+                                    (me['id'],)).fetchall()
+            elif brands is None:
+                rows = conn.execute('SELECT * FROM sale_proposals ORDER BY id DESC').fetchall()
+            else:
+                rows = conn.execute(f'SELECT * FROM sale_proposals WHERE brand_id IN ({scope_brand_sql}) ORDER BY id DESC').fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                d['credits'] = [dict(x) for x in conn.execute(
+                    'SELECT amount, due_date FROM sale_proposal_credits WHERE proposal_id=?', (r['id'],))]
+                out.append(d)
+            return jsonify(out)
+
+        # ---- ایجاد پیشنهاد فروش ----
+        if me['role'] != 'specialist':
+            return jsonify({'error': 'ثبت پیشنهاد فروش فقط برای کارشناس (بخش فروش) فعال است'}), 403
+        if 'فروش' not in str(conn.execute('SELECT IFNULL(d.name,\'\') n FROM users u '
+                                           'LEFT JOIN departments d ON d.id=u.department_id WHERE u.id=?',
+                                           (me['id'],)).fetchone()['n']):
+            return jsonify({'error': 'برای ثبت پیشنهاد فروش، بخش شما باید «فروش» باشد'}), 403
+        data = request.json or {}
+        now_ms = int(time.time() * 1000)
+        my_brands = brands if brands is not None else user_brand_ids(conn, me['id'])
+        if not my_brands:
+            return jsonify({'error': 'برندی برای شما تعریف نشده است'}), 400
+
+        customer = None
+        is_new_customer = 0
+        customer_id = data.get('customer_id')
+        if customer_id:
+            customer = conn.execute('SELECT * FROM customers WHERE id=?', (customer_id,)).fetchone()
+            if not customer or customer['brand_id'] not in my_brands:
+                return jsonify({'error': 'مشتری انتخابی در برندهای شما یافت نشد'}), 400
+        else:
+            cname = str(data.get('new_customer_name') or '').strip()
+            if not cname:
+                return jsonify({'error': 'مشتری را انتخاب کنید یا نام مشتری جدید را بنویسید'}), 400
+            clash = conn.execute(f'''SELECT 1 FROM customers WHERE name=? AND brand_id IN ({",".join("?" * len(my_brands))})
+                                     LIMIT 1''', (cname, *my_brands)).fetchone()
+            if clash:
+                return jsonify({'error': f'نام «{cname}» قبلاً در مشتریان ثبت شده است؛ نام دیگری وارد کنید یا از فهرست انتخاب کنید'}), 409
+            brand_row = conn.execute('SELECT name FROM brands WHERE id=?', (sorted(my_brands)[0],)).fetchone()
+            key = new_customer_key(conn)
+            cur = conn.execute('''INSERT INTO customers (customer_key,customer_code,name,brand_id,brand_name,source,created_by,created_at)
+                                  VALUES (?,?,?,?,?,?,?,?)''',
+                               (key, None, cname, sorted(my_brands)[0], brand_row['name'] if brand_row else None,
+                                'proposal', me['id'], now_ms))
+            customer = conn.execute('SELECT * FROM customers WHERE id=?', (cur.lastrowid,)).fetchone()
+            is_new_customer = 1
+
+        product = conn.execute('SELECT * FROM products WHERE id=?', (data.get('product_id') or 0,)).fetchone()
+        if not product or (product['brand_id'] not in my_brands):
+            return jsonify({'error': 'کالای انتخابی در برندهای شما یافت نشد'}), 400
+
+        def qty_for(unit):
+            return parse_number(data.get(unit))
+
+        unit = product['unit'] or 'عدد'
+        qty_map = {'عدد': 'quantity', 'کیلوگرم': 'weight', 'لیتر': 'volume', 'بسته': 'quantity', 'جفت': 'quantity'}
+        qty_field = qty_map.get(unit, 'quantity')
+        qty = qty_for(qty_field)
+        if qty is None or qty <= 0:
+            label = {'quantity': 'تعداد', 'weight': 'وزن', 'volume': 'حجم'}[qty_field]
+            return jsonify({'error': f'«{label}» معتبر وارد کنید'}), 400
+
+        price_row = conn.execute('SELECT * FROM product_prices WHERE product_id=?', (product['id'],)).fetchone()
+        ref_price = None
+        if price_row:
+            if price_row['mode'] == 'single':
+                ref_price = price_row['price']
+            elif price_row['mode'] == 'range' and price_row['min_price'] is not None:
+                ref_price = price_row['min_price']
+        unit_price = parse_number(data.get('unit_price'))
+        if unit_price is None:
+            unit_price = ref_price
+        if unit_price is None or unit_price <= 0:
+            return jsonify({'error': 'قیمت فروش را وارد کنید (برای این کالا قیمتی ثبت نشده است)'}), 400
+
+        credits = []
+        for item in (data.get('credit_items') or []):
+            amount = parse_number(item.get('amount')) if isinstance(item, dict) else None
+            due = str(item.get('due_date') or '').strip() if isinstance(item, dict) else ''
+            if amount is None or amount <= 0:
+                return jsonify({'error': 'مبلغ اعتباری نامعتبر است'}), 400
+            if not due:
+                return jsonify({'error': 'تاریخ سررسید هر مبلغ اعتباری الزامی است'}), 400
+            credits.append((amount, due))
+        cash = parse_number(data.get('cash_amount')) or 0
+        if cash < 0:
+            return jsonify({'error': 'مبلغ نقدی نمی‌تواند منفی باشد'}), 400
+        total_credit = round(sum(a for a, _ in credits), 2)
+        final_amount = round(qty * unit_price, 2)
+
+        profile = conn.execute('''SELECT u.name, u.role, d.name AS department_name, r.name AS job_role_name
+                                  FROM users u LEFT JOIN departments d ON d.id=u.department_id
+                                  LEFT JOIN job_roles r ON r.id=u.job_role_id WHERE u.id=?''', (me['id'],)).fetchone()
+        brand_row = conn.execute('SELECT name FROM brands WHERE id=?', (product['brand_id'],)).fetchone()
+        lock_for_create(conn)
+        code = next_proposal_code(conn)
+        cur = conn.execute('''INSERT INTO sale_proposals (proposal_code,creator_id,brand_id,brand_name,job_role,department,
+                              customer_id,customer_key,customer_name,is_new_customer,sub_category,product_id,product_code,
+                              product_name,unit,quantity,weight,volume,unit_price,final_amount,description,
+                              checks_in_collection,credit_balance,cash_amount,cash_date,total_credit,status,created_at)
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                           (code, me['id'], product['brand_id'], brand_row['name'] if brand_row else product['brand_name'],
+                            profile['job_role_name'], profile['department_name'], customer['id'], customer['customer_key'],
+                            customer['name'], is_new_customer, product['sub_category'], product['id'],
+                            product['source_product_id'], product['name'], unit,
+                            qty if qty_field == 'quantity' else None,
+                            qty if qty_field == 'weight' else None,
+                            qty if qty_field == 'volume' else None,
+                            unit_price, final_amount, str(data.get('description') or '').strip() or None,
+                            parse_number(data.get('checks_in_collection')), parse_number(data.get('credit_balance')),
+                            cash, jalali_today_str(), total_credit, 'active', now_ms))
+        for amount, due in credits:
+            conn.execute('INSERT INTO sale_proposal_credits (proposal_id,amount,due_date) VALUES (?,?,?)',
+                         (cur.lastrowid, amount, due))
+        conn.commit()
+        notify_brand_managers = conn.execute('SELECT manager_id FROM brands WHERE id=?', (product['brand_id'],)).fetchone()
+        if notify_brand_managers and notify_brand_managers['manager_id']:
+            create_notification(notify_brand_managers['manager_id'], 'پیشنهاد فروش جدید',
+                                f'«{profile["name"]}» پیشنهاد فروش {code} را برای مشتری «{customer["name"]}» ثبت کرد.',
+                                'info', conn=conn)
+        conn.commit()
+        return jsonify({'success': True, 'id': cur.lastrowid, 'proposal_code': code,
+                        'final_amount': final_amount, 'is_new_customer': bool(is_new_customer),
+                        'customer_key': customer['customer_key']})
+    finally:
+        conn.close()
+
+
+@app.route('/api/sales-board/proposals/<int:prop_id>', methods=['DELETE'])
+@login_required
+def delete_sale_proposal(prop_id):
+    me = current_user()
+    conn = get_db()
+    try:
+        allowed, brands = sales_board_access(conn, me)
+        if not allowed:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        prop = conn.execute('SELECT * FROM sale_proposals WHERE id=?', (prop_id,)).fetchone()
+        if not prop:
+            return jsonify({'error': 'پیشنهاد پیدا نشد'}), 404
+        if me['role'] not in SUPER_ROLES and prop['creator_id'] != me['id'] and \
+           not (me['role'] == 'supervisor' and brands is not None and prop['brand_id'] in brands):
+            return jsonify({'error': 'فقط سازنده یا سرپرست/مدیر می‌تواند پیشنهاد را حذف کند'}), 403
+        if brands is not None and prop['brand_id'] not in brands and prop['creator_id'] != me['id']:
+            return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+        conn.execute('DELETE FROM sale_proposal_credits WHERE proposal_id=?', (prop_id,))
+        conn.execute('DELETE FROM sale_proposals WHERE id=?', (prop_id,))
+        conn.commit()
+        return jsonify({'success': True})
     finally:
         conn.close()
 
